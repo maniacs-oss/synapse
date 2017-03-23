@@ -101,7 +101,7 @@ indicate which side is sending, these are *not* included on the wire::
     > POSITION caches 1
     > RDATA caches 2 ["get_user_by_id",["@01register-user:localhost:8823"],1490197670513]
     > RDATA events 14 ["$149019767112vOHxz:localhost:8823",
-    "!AFDCvgApUmpdfVjIXm:localhost:8823","m.room.guest_access","",null]
+        "!AFDCvgApUmpdfVjIXm:localhost:8823","m.room.guest_access","",null]
     < PING 1490197675618
     > ERROR server stopping
     * connection closed by server *
@@ -121,7 +121,17 @@ from commands import (
 from streams import STREAMS_MAP
 
 import logging
+import synapse.metrics
 
+
+metrics = synapse.metrics.get_metrics_for(__name__)
+
+inbound_commands_counter = metrics.register_counter(
+    "inbound_commands", labels=["command"],
+)
+outbound_commands_counter = metrics.register_counter(
+    "outbound_commands", labels=["command"],
+)
 
 logger = logging.getLogger(__name__)
 
@@ -210,6 +220,8 @@ class BaseReplicationStreamProtocol(LineOnlyReceiver):
 
         self.last_received_command = self.clock.time_msec()
 
+        inbound_commands_counter.inc(cmd_name)
+
         cmd_cls = COMMAND_MAP[cmd_name]
         try:
             cmd = cmd_cls.from_line(rest_of_line)
@@ -236,6 +248,8 @@ class BaseReplicationStreamProtocol(LineOnlyReceiver):
             logger.info("Queing as conn not ready %r", cmd)
             self.pending_commands.append(cmd)
             return
+
+        outbound_commands_counter.inc(cmd.NAME)
 
         string = "%s %s" % (cmd.NAME, cmd.to_line(),)
         if "\n" in string:

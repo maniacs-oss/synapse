@@ -21,8 +21,20 @@ from twisted.internet.protocol import Factory
 from streams import STREAMS_MAP, FederationStream
 from protocol import ServerReplicationStreamProtocol
 
-import logging
+from synapse.util.metrics import Measure, measure_func
 
+import logging
+import synapse.metrics
+
+
+metrics = synapse.metrics.get_metrics_for(__name__)
+stream_updates_counter = metrics.register_counter(
+    "stream_updates", labels=["stream_name"]
+)
+user_sync_counter = metrics.register_counter("user_sync")
+federation_ack_counter = metrics.register_counter("federation_ack")
+remove_pusher_counter = metrics.register_counter("remove_pusher")
+invalidate_cache_counter = metrics.register_counter("invalidate_cache")
 
 logger = logging.getLogger(__name__)
 
@@ -58,9 +70,12 @@ class ReplicationStreamer(object):
         self.store = hs.get_datastore()
         self.notifier = hs.get_notifier()
         self.presence_handler = hs.get_presence_handler()
+        self.clock = hs.get_clock()
 
         # Current connections.
         self.connections = []
+
+        metrics.register_callback("total_connections", lambda: len(self.connections))
 
         # List of streams that clients can subscribe to.
         # We only support federation stream if federation sending hase been
@@ -71,6 +86,18 @@ class ReplicationStreamer(object):
         ]
 
         self.streams_by_name = {stream.NAME: stream for stream in self.streams}
+
+        metrics.register_callback(
+            "connections_per_stream",
+            lambda: {
+                (stream_name,): len(
+                    conn for conn in self.connections
+                    if stream_name in conn.replication_streams
+                )
+                for stream_name in self.streams_by_name
+            },
+            labels=["stream_name"],
+        )
 
         self.federation_sender = None
         if not hs.config.send_federation:
@@ -125,48 +152,53 @@ class ReplicationStreamer(object):
             while self.pending_updates:
                 self.pending_updates = False
 
-                # First we tell the streams that they should update their
-                # current tokens.
-                for stream in self.streams:
-                    stream.advance_current_token()
+                with Measure(self.clock, "repl.stream.get_updates"):
+                    # First we tell the streams that they should update their
+                    # current tokens.
+                    for stream in self.streams:
+                        stream.advance_current_token()
 
-                for stream in self.streams:
-                    if stream.last_token == stream.upto_token:
-                        continue
+                    for stream in self.streams:
+                        if stream.last_token == stream.upto_token:
+                            continue
 
-                    logger.debug(
-                        "Getting stream: %s: %s -> %s",
-                        stream.NAME, stream.last_token, stream.upto_token
-                    )
-                    updates, current_token = yield stream.get_updates()
+                        logger.debug(
+                            "Getting stream: %s: %s -> %s",
+                            stream.NAME, stream.last_token, stream.upto_token
+                        )
+                        updates, current_token = yield stream.get_updates()
 
-                    logger.debug(
-                        "Sending %d updates to %d connections",
-                        len(updates), len(self.connections),
-                    )
+                        logger.debug(
+                            "Sending %d updates to %d connections",
+                            len(updates), len(self.connections),
+                        )
 
-                    if updates:
-                        logger.info("Streaming: %s -> %s", stream.NAME, updates[-1][0])
+                        if updates:
+                            logger.info(
+                                "Streaming: %s -> %s", stream.NAME, updates[-1][0]
+                            )
+                            stream_updates_counter.inc_by(len(updates), stream.NAME)
 
-                    # Some streams return multiple rows with the same stream IDs,
-                    # we need to make sure they get sent out in batches. We do
-                    # this by setting the current token to all but the last of
-                    # a series of updates with the same token to have a None
-                    # token. See RdataCommand for more details.
-                    batched_updates = _batch_updates(updates)
+                        # Some streams return multiple rows with the same stream IDs,
+                        # we need to make sure they get sent out in batches. We do
+                        # this by setting the current token to all but the last of
+                        # a series of updates with the same token to have a None
+                        # token. See RdataCommand for more details.
+                        batched_updates = _batch_updates(updates)
 
-                    for conn in self.connections:
-                        for token, row in batched_updates:
-                            try:
-                                conn.stream_update(stream.NAME, token, row)
-                            except Exception:
-                                logger.exception("Failed to replicate")
+                        for conn in self.connections:
+                            for token, row in batched_updates:
+                                try:
+                                    conn.stream_update(stream.NAME, token, row)
+                                except Exception:
+                                    logger.exception("Failed to replicate")
 
             logger.debug("No more pending updates, breaking poke loop")
         finally:
             self.pending_updates = False
             self.is_looping = False
 
+    @measure_func("repl.get_stream_updates")
     def get_stream_updates(self, stream_name, token):
         """For a given stream get all updates since token. This is called when
         a client first subscribes to a stream.
@@ -177,32 +209,40 @@ class ReplicationStreamer(object):
 
         return stream.get_updates_since(token)
 
+    @measure_func("repl.federation_ack")
     def federation_ack(self, token):
         """We've received an ack for federation stream from a client.
         """
+        federation_ack_counter.inc()
         if self.federation_sender:
             self.federation_sender.federation_ack(token)
 
+    @measure_func("repl.on_user_sync")
     def on_user_sync(self, conn_id, user_id, is_syncing):
         """A client has started/stopped syncing on a worker.
         """
+        user_sync_counter.inc()
         self.presence_handler.update_external_syncs_row(
             conn_id, user_id, is_syncing
         )
 
+    @measure_func("repl.on_remove_pusher")
     @defer.inlineCallbacks
     def on_remove_pusher(self, app_id, push_key, user_id):
         """A client has asked us to remove a pusher
         """
+        remove_pusher_counter.inc()
         yield self.store.delete_pusher_by_app_id_pushkey_user_id(
             app_id=app_id, pushkey=push_key, user_id=user_id
         )
 
         self.notifier.on_new_replication_data()
 
+    @measure_func("repl.on_invalidate_cache")
     def on_invalidate_cache(self, cache_func, keys):
         """The client has asked us to invalidate a cache
         """
+        invalidate_cache_counter.inc()
         getattr(self.store, cache_func).invalidate(tuple(keys))
 
     def send_sync_to_all_connections(self, data):
