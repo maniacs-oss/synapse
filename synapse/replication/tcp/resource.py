@@ -131,6 +131,9 @@ class ReplicationStreamer(object):
                     stream.advance_current_token()
 
                 for stream in self.streams:
+                    if stream.last_token == stream.upto_token:
+                        continue
+
                     logger.debug(
                         "Getting stream: %s: %s -> %s",
                         stream.NAME, stream.last_token, stream.upto_token
