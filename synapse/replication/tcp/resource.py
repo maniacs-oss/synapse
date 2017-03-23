@@ -90,10 +90,10 @@ class ReplicationStreamer(object):
         metrics.register_callback(
             "connections_per_stream",
             lambda: {
-                (stream_name,): len(
+                (stream_name,): len([
                     conn for conn in self.connections
                     if stream_name in conn.replication_streams
-                )
+                ])
                 for stream_name in self.streams_by_name
             },
             labels=["stream_name"],
